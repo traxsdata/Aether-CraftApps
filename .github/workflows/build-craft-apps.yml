@@ -1,0 +1,256 @@
+name: Build Craft apps for æther
+
+# Manual build of Craft apps from github.com/storytold sources.
+#
+# From GitHub: Actions -> "Build Craft apps for æther" -> Run workflow.
+# From the command line:
+#   gh workflow run build-craft-apps.yml -f apps="gridcraft photocraft"
+#
+# The workflow checks out the æther tree (github.com/traxsdata/Aether, at
+# aether_ref), clones each app's source, builds it against runner/eframe for
+# x86_64-unknown-linux-musl, packages it with tools/mkapp.py, and (optionally)
+# publishes the packages plus a craft-apps.json manifest to a release of this
+# repository. The build tooling and the per-app shells stay in the Aether
+# repository, next to the runner they build against.
+#
+# GitHub rejects release assets whose name ends in .app, so each package is
+# published twice: as <app>-<version>-aether-x86_64.aeapp (the package bytes
+# as they are; App Store and Aether's tools/fetch-craft-apps.py download this
+# one) and as a .app.zip holding the original .app file, for manual download.
+#
+# Only apps with a shell in Aether's tools/craft-shells/<app>.rs can be built
+# today: gridcraft and photocraft. Add a shell there before adding an app.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: "Space- or comma-separated app repos (empty = all apps with a shell)"
+        required: false
+        default: ""
+        type: string
+      release_tag:
+        description: "Release tag to publish to"
+        required: false
+        default: "craft-apps-latest"
+        type: string
+      aether_ref:
+        description: "Aether branch, tag or commit to build against"
+        required: false
+        default: "main"
+        type: string
+      publish_release:
+        description: "Publish/update a GitHub release with the packages"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+# Runs share one release and its manifest; don't let two publish at once.
+concurrency:
+  group: craft-apps-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare app list
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out Aether (to discover shells)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: traxsdata/Aether
+          ref: ${{ inputs.aether_ref }}
+          path: aether
+          persist-credentials: false
+
+      - name: Turn the input into a matrix
+        id: matrix
+        env:
+          APPS: ${{ inputs.apps }}
+        run: |
+          set -euo pipefail
+          apps="${APPS//,/ }"
+          read -r -a list <<< "$apps"
+          if [ "${#list[@]}" -eq 0 ]; then
+            mapfile -t list < <(find aether/tools/craft-shells -maxdepth 1 -name "*.rs" -printf "%f\n" 2>/dev/null | sed "s/\.rs$//" | sort)
+          fi
+          if [ "${#list[@]}" -eq 0 ]; then
+            echo "::error::No apps requested and no tools/craft-shells/*.rs found in Aether."
+            exit 1
+          fi
+          for app in "${list[@]}"; do
+            if [[ ! "$app" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+              echo "::error::Invalid app name: $app"
+              exit 1
+            fi
+          done
+          json=$(printf '%s\n' "${list[@]}" | python3 -c 'import json,sys; print(json.dumps([x.strip() for x in sys.stdin if x.strip()]))')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "Building: ${list[*]}"
+
+  build:
+    name: Build ${{ matrix.app }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: aether
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out Aether
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: traxsdata/Aether
+          ref: ${{ inputs.aether_ref }}
+          path: aether
+          persist-credentials: false
+
+      - name: Install Rust (musl target)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils clang jq lld python3 zip
+
+      - name: Require a runner shell
+        run: |
+          set -euo pipefail
+          shell="tools/craft-shells/${{ matrix.app }}.rs"
+          if [ ! -f "$shell" ]; then
+            echo "::error::No $shell. Add a shell for ${{ matrix.app }} before building it; the current workflow can build: $(ls tools/craft-shells | sed 's/\.rs$//' | tr '\n' ' ')"
+            exit 1
+          fi
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          tools/build-craft.sh "${{ matrix.app }}"
+
+      - name: Name the release asset and write metadata
+        run: |
+          set -euo pipefail
+          src="build/apps/${{ matrix.app }}.app"
+          test -f "$src"
+          mkdir -p dist
+          name=$(dd if="$src" bs=1 skip=16 count=32 2>/dev/null | tr -d '\000')
+          title=$(dd if="$src" bs=1 skip=48 count=32 2>/dev/null | tr -d '\000')
+          version=$(dd if="$src" bs=1 skip=80 count=32 2>/dev/null | tr -d '\000')
+          source=$(dd if="$src" bs=1 skip=112 count=96 2>/dev/null | tr -d '\000')
+          [ -n "$name" ] || { echo "::error::$src has no package name"; exit 1; }
+          version="${version:-0}"
+          package="${name}-${version}-aether-x86_64.app"
+          # GitHub's release upload rejects the .app extension: publish the
+          # package bytes as .aeapp, and a .zip holding the original .app file.
+          package_asset="${name}-${version}-aether-x86_64.aeapp"
+          asset="${package}.zip"
+          cp "$src" "dist/$package_asset"
+          cp "$src" "dist/$package"
+          (cd dist && zip -q "$asset" "$package")
+          rm "dist/$package"
+          aether_commit=$(git rev-parse HEAD)
+          sha256=$(sha256sum "dist/$asset" | awk '{print $1}')
+          size=$(stat -c %s "dist/$asset")
+          package_sha256=$(sha256sum "$src" | awk '{print $1}')
+          package_size=$(stat -c %s "$src")
+          jq -n \
+            --arg name "$name" \
+            --arg title "$title" \
+            --arg version "$version" \
+            --arg source "$source" \
+            --arg package "$package" \
+            --arg package_asset "$package_asset" \
+            --arg aether_commit "$aether_commit" \
+            --arg asset "$asset" \
+            --arg sha256 "$sha256" \
+            --arg package_sha256 "$package_sha256" \
+            --argjson size "$size" \
+            --argjson package_size "$package_size" \
+            '{name:$name,title:$title,version:$version,source:$source,aether_commit:$aether_commit,package:$package,package_asset:$package_asset,asset:$asset,sha256:$sha256,size:$size,package_sha256:$package_sha256,package_size:$package_size}' \
+            > "dist/$name.json"
+          echo "Built $asset ($size bytes, sha256 $sha256)"
+          echo "  contains $package ($package_size bytes, sha256 $package_sha256), also published as $package_asset"
+
+      - name: Upload package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: craft-${{ matrix.app }}
+          path: aether/dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish packages
+    needs: [prepare, build]
+    if: always() && inputs.publish_release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: craft-*
+          path: dist
+          merge-multiple: true
+
+      - name: Merge the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The release job has no checkout, so tell gh which repository to use.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if ! ls dist/*.aeapp >/dev/null 2>&1; then
+            echo "::error::No packages were built; nothing to publish."
+            exit 1
+          fi
+          # Keep the entries of apps this run didn't rebuild.
+          mkdir -p old
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release download "$TAG" --pattern craft-apps.json --dir old || true
+          fi
+          [ -f old/craft-apps.json ] || echo '{"apps":[]}' > old/craft-apps.json
+          jq -s '.[0].apps as $old | .[1:] as $new
+                 | {apps: (($old | map(select(.name as $n | $new | map(.name) | index($n) | not))) + $new | sort_by(.name))}' \
+            old/craft-apps.json dist/*.json > craft-apps.json
+          mv craft-apps.json dist/craft-apps.json
+          echo "Manifest:"
+          cat dist/craft-apps.json
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.aeapp dist/*.zip dist/*.json --clobber
+          else
+            gh release create "$TAG" dist/*.aeapp dist/*.zip dist/*.json \
+              --title "Craft apps for æther" \
+              --notes "Built from github.com/storytold sources by the manual Build Craft apps workflow. App Store installs the .aeapp packages; each .app.zip holds the same package as a .app file for manual download (GitHub does not allow .app release assets). The craft-apps.json manifest lists each package's version, source, Aether commit and SHA-256."
+          fi
+          # Drop older versions of the apps this run rebuilt.
+          keep=$(cd dist && ls)
+          for f in dist/*.json; do
+            n=$(basename "$f" .json)
+            [ "$n" = craft-apps ] && continue
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while read -r a; do
+              if [[ "$a" == "$n"-[0-9]* ]] && ! grep -qxF "$a" <<< "$keep"; then
+                echo "Deleting stale asset $a"
+                gh release delete-asset "$TAG" "$a" --yes
+              fi
+            done
+          done
+          gh release view "$TAG" --json url --jq '.url'
